@@ -31,6 +31,7 @@ use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpData, TcpEof, TcpFaile
 use crate::config::AgentdConfig;
 use crate::error::{AgentdError, AgentdResult};
 use crate::fs::{FsReadSession, FsState, FsStreamSession, FsWriteSession};
+use crate::process::ProcessManager;
 use crate::serial::AGENT_PORT_NAME;
 use crate::session::{
     ExecSession, RawActivity, RawSessionCompletion, SessionOutput, resolve_default_user,
@@ -141,6 +142,8 @@ pub async fn run(
     config: &AgentdConfig,
     port_file: File,
 ) -> AgentdResult<()> {
+    let _process_manager = ProcessManager::get()?;
+
     // Set non-blocking for async I/O. Early boot handshakes use the same fd
     // in blocking mode before it is moved into the async loop.
     let port_fd = port_file.as_raw_fd();

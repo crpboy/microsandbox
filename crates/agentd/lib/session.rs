@@ -3,20 +3,21 @@
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::process::Stdio;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::{iter, mem, ptr};
 
 use nix::pty;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use microsandbox_protocol::exec::{ExecFailed, ExecFailureKind, ExecRequest};
 
 use crate::config::SecurityProfile;
 use crate::error::{AgentdError, AgentdResult};
+use crate::process::{ProcessExitWatcher, ProcessManager};
 use crate::rlimit;
 
 //--------------------------------------------------------------------------------------------------
@@ -202,6 +203,15 @@ struct ExecErrorPipe {
     write_end: OwnedFd,
 }
 
+/// A piped process whose exit status is observed by [`ProcessManager`].
+struct PipedProcess {
+    pid: i32,
+    stdin: Option<tokio::process::ChildStdin>,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    exit_watcher: ProcessExitWatcher,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CapUserHeader {
@@ -276,10 +286,25 @@ impl ExecSession {
         default_user: Option<&str>,
         security_profile: SecurityProfile,
     ) -> AgentdResult<Self> {
+        let process_manager = ProcessManager::get()?;
         if req.tty {
-            Self::spawn_pty(id, req, tx, default_user, security_profile)
+            Self::spawn_pty(
+                id,
+                req,
+                tx,
+                default_user,
+                security_profile,
+                &process_manager,
+            )
         } else {
-            Self::spawn_pipe(id, req, tx, default_user, security_profile)
+            Self::spawn_pipe(
+                id,
+                req,
+                tx,
+                default_user,
+                security_profile,
+                &process_manager,
+            )
         }
     }
 
@@ -350,6 +375,7 @@ impl ExecSession {
         tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
         default_user: Option<&str>,
         security_profile: SecurityProfile,
+        process_manager: &ProcessManager,
     ) -> AgentdResult<Self> {
         let pty = pty::openpty(None, None)?;
         let err_pipe = new_exec_error_pipe()?;
@@ -418,6 +444,10 @@ impl ExecSession {
 
         // Pre-parse rlimits before fork (no allocations in child).
         let parsed_rlimits = rlimit::to_libc(&req.rlimits);
+
+        // Allow concurrent process creation while preventing the central
+        // reaper from observing this child before its PID is tracked.
+        let spawn_guard = process_manager.spawn_guard()?;
 
         // Fork.
         let pid = unsafe { libc::fork() };
@@ -509,9 +539,10 @@ impl ExecSession {
         // Parent process.
         drop(pty.slave);
         drop(err_pipe.write_end);
+        let exit_watcher = spawn_guard.track(pid)?;
 
         if let Some(exec_errno) = read_exec_error(err_pipe.read_end.as_raw_fd())? {
-            let _ = wait_for_exec_failure_child(pid);
+            drop(exit_watcher);
             let io_err = std::io::Error::from_raw_os_error(exec_errno);
             return Err(AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
                 &io_err, &req.cmd, "execvp",
@@ -526,7 +557,7 @@ impl ExecSession {
         let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_fd) };
 
         // Spawn background reader task.
-        tokio::spawn(pty_reader_task(id, pid, reader_fd, tx));
+        tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, tx));
 
         Ok(Self {
             pid,
@@ -542,6 +573,7 @@ impl ExecSession {
         tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
         default_user: Option<&str>,
         security_profile: SecurityProfile,
+        process_manager: &ProcessManager,
     ) -> AgentdResult<Self> {
         let mut cmd = Command::new(&req.cmd);
         cmd.args(&req.args)
@@ -588,21 +620,16 @@ impl ExecSession {
             });
         }
 
-        let cmd_label = req.cmd.clone();
-        let mut child = cmd.spawn().map_err(|err| {
-            AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
-                &err,
-                &cmd_label,
-                "Command::spawn",
-            ))
-        })?;
-        let pid = child.id().unwrap_or(0) as i32;
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let PipedProcess {
+            pid,
+            stdin,
+            stdout,
+            stderr,
+            exit_watcher,
+        } = spawn_piped_process(cmd, process_manager)?;
 
         // Spawn background reader task.
-        tokio::spawn(pipe_reader_task(id, child, stdout, stderr, tx));
+        tokio::spawn(pipe_reader_task(id, stdout, stderr, exit_watcher, tx));
 
         Ok(Self {
             pid,
@@ -615,6 +642,69 @@ impl ExecSession {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn spawn_piped_process(
+    mut command: Command,
+    process_manager: &ProcessManager,
+) -> AgentdResult<PipedProcess> {
+    let cmd_label = command.get_program().to_string_lossy().into_owned();
+
+    // Allow concurrent process creation while preventing the central reaper
+    // from observing this child before its PID is tracked.
+    let spawn_guard = process_manager.spawn_guard()?;
+    let mut child = command.spawn().map_err(|error| {
+        AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
+            &error,
+            &cmd_label,
+            "Command::spawn",
+        ))
+    })?;
+    let pid = child.id() as i32;
+    let exit_watcher = spawn_guard.track(pid)?;
+
+    let stdio = (|| {
+        let stdin = child
+            .stdin
+            .take()
+            .map(tokio::process::ChildStdin::from_std)
+            .transpose()?;
+        let stdout = child
+            .stdout
+            .take()
+            .map(tokio::process::ChildStdout::from_std)
+            .transpose()?;
+        let stderr = child
+            .stderr
+            .take()
+            .map(tokio::process::ChildStderr::from_std)
+            .transpose()?;
+        Ok::<_, std::io::Error>((stdin, stdout, stderr))
+    })();
+    let (stdin, stdout, stderr) = stdio.map_err(|error| {
+        // The command has already exec'd successfully. If an async stdio
+        // adapter cannot be registered, do not leave an unreported process
+        // group running after the host receives ExecFailed.
+        let _ = signal::kill(Pid::from_raw(-pid), Signal::SIGKILL);
+        AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
+            &error,
+            &cmd_label,
+            "Command::spawn",
+        ))
+    })?;
+
+    // `std::process::Child` has no asynchronous reaper on drop. Once the PID
+    // is tracked, the process manager owns its exit status during normal
+    // operation; terminal teardown may reap it directly as a fallback.
+    drop(child);
+
+    Ok(PipedProcess {
+        pid,
+        stdin,
+        stdout,
+        stderr,
+        exit_watcher,
+    })
+}
 
 fn new_exec_error_pipe() -> AgentdResult<ExecErrorPipe> {
     let mut fds = [0; 2];
@@ -652,14 +742,6 @@ fn read_exec_error(err_fd: RawFd) -> AgentdResult<Option<i32>> {
         )));
     }
     Ok(Some(i32::from_ne_bytes(buf)))
-}
-
-fn wait_for_exec_failure_child(pid: i32) -> AgentdResult<()> {
-    let ret = unsafe { libc::waitpid(pid, ptr::null_mut(), 0) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
 }
 
 fn apply_exec_security_profile(profile: SecurityProfile) -> AgentdResult<()> {
@@ -1054,8 +1136,8 @@ fn wait_fd_writable(fd: RawFd) -> AgentdResult<()> {
 /// Background task that reads from a PTY master fd and sends output events.
 async fn pty_reader_task(
     id: u32,
-    pid: i32,
     master_fd: OwnedFd,
+    exit_watcher: ProcessExitWatcher,
     tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
 ) {
     let tx_output = tx.clone();
@@ -1099,16 +1181,16 @@ async fn pty_reader_task(
 
     let _ = read_result;
 
-    let code = wait_for_pid(pid).await;
+    let code = exit_watcher.await;
     let _ = tx.send((id, SessionOutput::Exited(code)));
 }
 
 /// Background task that reads from piped stdout/stderr and sends output events.
 async fn pipe_reader_task(
     id: u32,
-    mut child: Child,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
+    exit_watcher: ProcessExitWatcher,
     tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
 ) {
     let mut stdout = stdout;
@@ -1156,30 +1238,9 @@ async fn pipe_reader_task(
         }
     }
 
-    // Both streams are done — wait for process exit.
-    let code = match child.wait().await {
-        Ok(status) => status.code().unwrap_or(-1),
-        Err(_) => -1,
-    };
+    let code = exit_watcher.await;
 
     let _ = tx.send((id, SessionOutput::Exited(code)));
-}
-
-/// Waits for a process to exit by PID and returns the exit code.
-async fn wait_for_pid(pid: i32) -> i32 {
-    tokio::task::spawn_blocking(move || {
-        let mut status: i32 = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-        if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -1
-        }
-    })
-    .await
-    .unwrap_or(-1)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1188,6 +1249,9 @@ async fn wait_for_pid(pid: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::io::Read;
+    use std::process::{Command as StdCommand, Stdio as StdStdio};
     use std::time::Duration;
 
     use tokio::time;
@@ -1195,6 +1259,408 @@ mod tests {
     use microsandbox_protocol::exec::ExecRequest;
 
     use super::*;
+
+    const REAP_HELPER_ENV: &str = "MSB_AGENTD_SESSION_REAP_HELPER";
+    const REAP_HELPER_SENTINEL: &str = "session-reap-helper-passed";
+    const REAP_TEST_NAME: &str = "session::tests::test_spawn_reaps_adopted_descendant";
+    const CONCURRENT_HELPER_ENV: &str = "MSB_AGENTD_CONCURRENT_SPAWN_HELPER";
+    const CONCURRENT_HELPER_SENTINEL: &str = "concurrent-spawn-helper-passed";
+    const CONCURRENT_TEST_NAME: &str = "session::tests::test_concurrent_spawn_exit_codes";
+    const RUNTIME_HELPER_ENV: &str = "MSB_AGENTD_RUNTIME_REPLACEMENT_HELPER";
+    const RUNTIME_HELPER_SENTINEL: &str = "runtime-replacement-helper-passed";
+    const RUNTIME_TEST_NAME: &str = "session::tests::test_spawn_survives_runtime_replacement";
+    const PIPE_OWNER_HELPER_ENV: &str = "MSB_AGENTD_PIPE_OWNER_HELPER";
+    const PIPE_OWNER_HELPER_SENTINEL: &str = "pipe-owner-helper-passed";
+    const PIPE_OWNER_TEST_NAME: &str =
+        "session::tests::test_piped_process_exit_outlives_spawning_runtime";
+
+    #[test]
+    fn test_spawn_reaps_adopted_descendant() {
+        if std::env::var_os(REAP_HELPER_ENV).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("session reap test runtime");
+            runtime.block_on(run_adopted_descendant_scenario());
+            println!("{REAP_HELPER_SENTINEL}");
+            return;
+        }
+
+        let mut helper = StdCommand::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", REAP_TEST_NAME, "--nocapture"])
+            .env(REAP_HELPER_ENV, "1")
+            .stdout(StdStdio::piped())
+            .spawn()
+            .expect("spawn isolated session reap test");
+        let mut output = String::new();
+        helper
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_string(&mut output)
+            .expect("read helper stdout");
+
+        match helper.wait() {
+            Ok(status) => assert!(status.success(), "helper failed: {status}\n{output}"),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            Err(error) => panic!("wait for helper: {error}"),
+        }
+        assert!(
+            output.contains(REAP_HELPER_SENTINEL),
+            "helper did not complete the session reap scenario:\n{output}"
+        );
+    }
+
+    async fn run_adopted_descendant_scenario() {
+        let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) };
+        assert_eq!(
+            ret,
+            0,
+            "set child subreaper: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = ExecRequest {
+            cmd: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 >/dev/null 2>&1 & echo $!".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty: false,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+
+        let _session = ExecSession::spawn(17, &req, tx, None, SecurityProfile::Default)
+            .expect("spawn background descendant session");
+        let mut stdout = Vec::new();
+        let mut exit = None;
+        time::timeout(Duration::from_secs(10), async {
+            while let Some((id, output)) = rx.recv().await {
+                assert_eq!(id, 17);
+                match output {
+                    SessionOutput::Stdout(data) => stdout.extend_from_slice(&data),
+                    SessionOutput::Exited(code) => {
+                        exit = Some(code);
+                        break;
+                    }
+                    SessionOutput::Stderr(_) | SessionOutput::Raw(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("wait for background descendant session");
+
+        assert_eq!(exit, Some(0));
+        let descendant_pid: i32 = String::from_utf8(stdout)
+            .expect("descendant PID is UTF-8")
+            .trim()
+            .parse()
+            .expect("parse descendant PID");
+        let expected_parent = std::process::id().to_string();
+        let status_path = format!("/proc/{descendant_pid}/status");
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(status) = std::fs::read_to_string(&status_path)
+                    && status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("PPid:"))
+                        .is_some_and(|ppid| ppid.trim() == expected_parent)
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant should be adopted by the helper subreaper");
+
+        let ret = unsafe { libc::kill(descendant_pid, libc::SIGTERM) };
+        assert_eq!(
+            ret,
+            0,
+            "terminate descendant: {}",
+            std::io::Error::last_os_error()
+        );
+        let proc_path = format!("/proc/{descendant_pid}");
+        time::timeout(Duration::from_secs(5), async {
+            while std::path::Path::new(&proc_path).exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant should be reaped");
+
+        let ret = unsafe { libc::waitpid(descendant_pid, ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(ret, -1, "descendant {descendant_pid} was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn test_concurrent_spawn_exit_codes() {
+        if std::env::var_os(CONCURRENT_HELPER_ENV).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("concurrent spawn test runtime");
+            runtime.block_on(run_concurrent_spawn_scenario());
+            println!("{CONCURRENT_HELPER_SENTINEL}");
+            return;
+        }
+
+        let mut helper = StdCommand::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", CONCURRENT_TEST_NAME, "--nocapture"])
+            .env(CONCURRENT_HELPER_ENV, "1")
+            .stdout(StdStdio::piped())
+            .spawn()
+            .expect("spawn isolated concurrent session test");
+        let mut output = String::new();
+        helper
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_string(&mut output)
+            .expect("read helper stdout");
+
+        match helper.wait() {
+            Ok(status) => assert!(status.success(), "helper failed: {status}\n{output}"),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            Err(error) => panic!("wait for helper: {error}"),
+        }
+        assert!(
+            output.contains(CONCURRENT_HELPER_SENTINEL),
+            "helper did not complete the concurrent spawn scenario:\n{output}"
+        );
+    }
+
+    async fn run_concurrent_spawn_scenario() {
+        const PROCESS_COUNT: u32 = 12;
+
+        let runtime_handle = tokio::runtime::Handle::current();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut spawn_threads = Vec::new();
+        for offset in 0..PROCESS_COUNT {
+            let handle = runtime_handle.clone();
+            let tx = tx.clone();
+            spawn_threads.push(std::thread::spawn(move || {
+                let _runtime = handle.enter();
+                let code = 20 + offset as i32;
+                let req = ExecRequest {
+                    cmd: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), format!("exit {code}")],
+                    env: Vec::new(),
+                    cwd: None,
+                    user: None,
+                    tty: offset % 2 == 1,
+                    rows: 24,
+                    cols: 80,
+                    rlimits: Vec::new(),
+                };
+                ExecSession::spawn(100 + offset, &req, tx, None, SecurityProfile::Default)
+            }));
+        }
+        drop(tx);
+
+        let mut sessions = Vec::new();
+        for thread in spawn_threads {
+            sessions.push(
+                thread
+                    .join()
+                    .expect("concurrent spawn thread")
+                    .expect("concurrent process spawn"),
+            );
+        }
+
+        let mut exits = HashMap::new();
+        time::timeout(Duration::from_secs(15), async {
+            while exits.len() < PROCESS_COUNT as usize {
+                let (id, output) = rx.recv().await.expect("session output");
+                if let SessionOutput::Exited(code) = output {
+                    exits.insert(id, code);
+                }
+            }
+        })
+        .await
+        .expect("wait for concurrent exits");
+
+        for offset in 0..PROCESS_COUNT {
+            assert_eq!(exits.get(&(100 + offset)), Some(&(20 + offset as i32)));
+        }
+        drop(sessions);
+    }
+
+    #[test]
+    fn test_spawn_survives_runtime_replacement() {
+        if std::env::var_os(RUNTIME_HELPER_ENV).is_some() {
+            run_runtime_replacement_scenario();
+            println!("{RUNTIME_HELPER_SENTINEL}");
+            return;
+        }
+
+        let mut helper = StdCommand::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", RUNTIME_TEST_NAME, "--nocapture"])
+            .env(RUNTIME_HELPER_ENV, "1")
+            .stdout(StdStdio::piped())
+            .spawn()
+            .expect("spawn isolated runtime replacement test");
+        let mut output = String::new();
+        helper
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_string(&mut output)
+            .expect("read helper stdout");
+
+        match helper.wait() {
+            Ok(status) => assert!(status.success(), "helper failed: {status}\n{output}"),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            Err(error) => panic!("wait for helper: {error}"),
+        }
+        assert!(
+            output.contains(RUNTIME_HELPER_SENTINEL),
+            "helper did not complete the runtime replacement scenario:\n{output}"
+        );
+    }
+
+    fn run_runtime_replacement_scenario() {
+        for (id, code) in [(201, 51), (202, 52)] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("replacement test runtime");
+            runtime.block_on(run_single_pipe_spawn(id, code));
+        }
+    }
+
+    async fn run_single_pipe_spawn(id: u32, code: i32) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = ExecRequest {
+            cmd: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), format!("exit {code}")],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty: false,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+        let _session = ExecSession::spawn(id, &req, tx, None, SecurityProfile::Default)
+            .expect("spawn session on replacement runtime");
+
+        let actual = time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (actual_id, output) = rx.recv().await.expect("session output");
+                assert_eq!(actual_id, id);
+                if let SessionOutput::Exited(actual) = output {
+                    break actual;
+                }
+            }
+        })
+        .await
+        .expect("wait for exit on replacement runtime");
+        assert_eq!(actual, code);
+    }
+
+    #[test]
+    fn test_piped_process_exit_outlives_spawning_runtime() {
+        if std::env::var_os(PIPE_OWNER_HELPER_ENV).is_some() {
+            run_piped_process_exit_scenario();
+            println!("{PIPE_OWNER_HELPER_SENTINEL}");
+            return;
+        }
+
+        let mut helper = StdCommand::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", PIPE_OWNER_TEST_NAME, "--nocapture"])
+            .env(PIPE_OWNER_HELPER_ENV, "1")
+            .stdout(StdStdio::piped())
+            .spawn()
+            .expect("spawn isolated pipe owner test");
+        let mut output = String::new();
+        helper
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_string(&mut output)
+            .expect("read helper stdout");
+
+        match helper.wait() {
+            Ok(status) => assert!(status.success(), "helper failed: {status}\n{output}"),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            Err(error) => panic!("wait for helper: {error}"),
+        }
+        assert!(
+            output.contains(PIPE_OWNER_HELPER_SENTINEL),
+            "helper did not complete the pipe owner scenario:\n{output}"
+        );
+    }
+
+    fn run_piped_process_exit_scenario() {
+        let process_manager = ProcessManager::get().expect("get process manager");
+        let (blocker_ready_tx, blocker_ready_rx) = std::sync::mpsc::channel();
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+        let blocker_manager = std::sync::Arc::clone(&process_manager);
+        let blocker_thread = std::thread::spawn(move || {
+            let reap_blocker = blocker_manager
+                .spawn_guard()
+                .expect("block process reaping");
+            blocker_ready_tx
+                .send(())
+                .expect("report process reaping blocked");
+            release_blocker_rx
+                .recv()
+                .expect("wait to release process reaping");
+            drop(reap_blocker);
+        });
+        blocker_ready_rx
+            .recv()
+            .expect("wait for process reaping blocker");
+
+        let spawning_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("spawning runtime");
+        let exit_watcher = {
+            let _runtime_guard = spawning_runtime.enter();
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "exit 63"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let process =
+                spawn_piped_process(command, &process_manager).expect("spawn piped process");
+            let PipedProcess { exit_watcher, .. } = process;
+            exit_watcher
+        };
+        drop(spawning_runtime);
+
+        let waiting_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("waiting runtime");
+        waiting_runtime.block_on(async {
+            time::sleep(Duration::from_millis(250)).await;
+        });
+        release_blocker_tx
+            .send(())
+            .expect("release process reaping blocker");
+        blocker_thread.join().expect("process reaping blocker");
+        let code = waiting_runtime.block_on(async {
+            time::timeout(Duration::from_secs(5), exit_watcher)
+                .await
+                .expect("wait for piped process exit")
+        });
+        assert_eq!(code, 63);
+    }
 
     #[tokio::test]
     async fn test_pty_reader_drains_ready_fd() {
@@ -1425,8 +1891,16 @@ mod tests {
             rlimits: Vec::new(),
         };
 
-        let err = ExecSession::spawn(9, &req, tx, None, SecurityProfile::Default)
-            .expect_err("spawn should fail");
+        let process_manager = ProcessManager::new_for_test();
+        let err = ExecSession::spawn_pipe(
+            9,
+            &req,
+            tx,
+            None,
+            SecurityProfile::Default,
+            &process_manager,
+        )
+        .expect_err("spawn should fail");
 
         // Spawn failures now produce the typed `ExecSpawnFailed` so
         // the host can render a useful message + hint. The classifier
