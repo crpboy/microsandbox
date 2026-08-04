@@ -9,18 +9,17 @@
 //! exception: it may reap any remaining child directly when the manager itself
 //! can no longer be assumed healthy.
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::task::{Context, Poll};
 use std::thread;
 
 use tokio::signal::unix::{Signal, SignalKind};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::error::{AgentdError, AgentdResult};
 
@@ -30,30 +29,50 @@ use crate::error::{AgentdError, AgentdResult};
 
 static PROCESS_MANAGER: OnceLock<Arc<ProcessManager>> = OnceLock::new();
 
-std::thread_local! {
-    static PROCESS_SPAWN_GUARD_HELD: Cell<bool> = const { Cell::new(false) };
-}
+/// Maximum number of children reaped while holding the process-state lock.
+///
+/// Releasing the lock between batches prevents a fork-heavy workload from
+/// starving exec spawning and signalling indefinitely.
+const REAP_BATCH_SIZE: usize = 64;
 
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
 /// Coordinates process spawning, exit observation, and process-wide child reaping.
+#[derive(Debug)]
 pub struct ProcessManager {
-    spawn_gate: RwLock<()>,
     state: Mutex<ProcessManagerState>,
     startup_error: OnceLock<String>,
-    terminal_error: Mutex<Option<String>>,
+    failure_tx: watch::Sender<Option<String>>,
 }
 
+#[derive(Debug)]
 struct ProcessManagerState {
-    processes: HashMap<i32, oneshot::Sender<i32>>,
+    processes: HashMap<i32, TrackedProcess>,
+    next_generation: u64,
+    terminal_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct TrackedProcess {
+    generation: u64,
+    exit_tx: Option<oneshot::Sender<i32>>,
 }
 
 /// Keeps process reaping paused until a newly spawned PID is tracked.
 pub struct ProcessSpawnGuard<'a> {
-    manager: &'a ProcessManager,
-    _spawn_gate: RwLockReadGuard<'a, ()>,
+    state: MutexGuard<'a, ProcessManagerState>,
+}
+
+/// Stable identity for one registration of an operating-system PID.
+///
+/// PIDs can be reused after a child is reaped. The generation prevents an old
+/// exec session from signalling a newer process that received the same PID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessIdentity {
+    pid: i32,
+    generation: u64,
 }
 
 /// Observes the eventual exit code of a tracked process.
@@ -62,7 +81,7 @@ pub struct ProcessSpawnGuard<'a> {
 /// unexpectedly drops the notification, the failure is logged and also resolves
 /// to `-1` to preserve the exec-session wire protocol.
 pub struct ProcessExitWatcher {
-    pid: i32,
+    identity: ProcessIdentity,
     receiver: oneshot::Receiver<i32>,
 }
 
@@ -94,11 +113,11 @@ impl ProcessManager {
     }
 
     fn new() -> Self {
+        let (failure_tx, _) = watch::channel(None);
         Self {
-            spawn_gate: RwLock::new(()),
             state: Mutex::new(ProcessManagerState::new()),
             startup_error: OnceLock::new(),
-            terminal_error: Mutex::new(None),
+            failure_tx,
         }
     }
 
@@ -107,41 +126,79 @@ impl ProcessManager {
         Self::new()
     }
 
-    /// Opens a shared spawn section that must end by tracking the child PID.
+    /// Opens a spawn section that must end by tracking the child PID.
     ///
-    /// The returned guard permits other spawns concurrently but temporarily
-    /// prevents the process manager from consuming an untracked fast exit.
-    /// It must be acquired immediately before the OS spawn or fork operation.
-    /// Acquiring it blocks synchronously while an exclusive reap pass owns the gate.
+    /// The returned guard serializes the short spawn-to-registration window with
+    /// reaping. Production exec requests are already spawned serially by the agent
+    /// loop, so allowing parallel spawns here adds complexity without throughput.
     ///
     /// # Errors
     ///
-    /// Returns an error if the current thread already holds a spawn guard or the
-    /// process manager has terminated.
+    /// Returns an error if the process manager has terminated.
     pub fn spawn_guard(&self) -> AgentdResult<ProcessSpawnGuard<'_>> {
-        if PROCESS_SPAWN_GUARD_HELD.get() {
-            return Err(AgentdError::ExecSession(
-                "the current thread already holds a process spawn guard".to_string(),
-            ));
-        }
-
-        let spawn_gate = self
-            .spawn_gate
-            .read()
+        let state = self
+            .state
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = state.terminal_error.as_ref() {
+            return Err(AgentdError::ExecSession(error.clone()));
+        }
+        Ok(ProcessSpawnGuard { state })
+    }
+
+    /// Subscribes to terminal process-manager failures.
+    ///
+    /// The receiver is created before checking current state so a failure cannot
+    /// occur between the check and subscription without being observed.
+    pub fn subscribe_failure(&self) -> AgentdResult<watch::Receiver<Option<String>>> {
+        let receiver = self.failure_tx.subscribe();
         if let Some(error) = self
-            .terminal_error
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_error
             .as_ref()
         {
             return Err(AgentdError::ExecSession(error.clone()));
         }
-        PROCESS_SPAWN_GUARD_HELD.set(true);
-        Ok(ProcessSpawnGuard {
-            manager: self,
-            _spawn_gate: spawn_gate,
-        })
+        Ok(receiver)
+    }
+
+    /// Signals a tracked process group only while its registration is current.
+    ///
+    /// Holding the state lock across the identity check and `kill` prevents a
+    /// reaped PID from being registered to a new session in between them.
+    pub fn signal_process_group(&self, identity: ProcessIdentity, signum: i32) -> AgentdResult<()> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(process) = state.processes.get(&identity.pid) else {
+            return Ok(());
+        };
+        if process.generation != identity.generation {
+            return Ok(());
+        }
+
+        if process.exit_tx.is_some() {
+            signal_process_group_or_process(identity.pid, signum)
+        } else {
+            // Once the leader has been reaped, a direct-PID fallback could hit
+            // an unrelated process that reused its PID. Only the still-existing
+            // process group is a valid target for the completed registration.
+            signal_process_group_only(identity.pid, signum)
+        }
+    }
+
+    /// Releases a process registration when its exec session is no longer signalable.
+    pub(crate) fn release(&self, identity: ProcessIdentity) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.matches(identity) {
+            state.processes.remove(&identity.pid);
+        }
     }
 
     fn launch_thread(self: &Arc<Self>) {
@@ -180,9 +237,10 @@ impl ProcessManager {
             )));
         }
         match self
-            .terminal_error
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_error
             .as_ref()
         {
             Some(error) => Err(AgentdError::ExecSession(error.clone())),
@@ -191,39 +249,54 @@ impl ProcessManager {
     }
 
     fn fail(&self, error: String) {
-        let _reap_gate = self
-            .spawn_gate
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        *self
-            .terminal_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .processes
-            .clear();
-    }
-
-    async fn run(self: Arc<Self>, mut signal: Signal) {
-        self.reap_exited();
-        while signal.recv().await.is_some() {
-            self.reap_exited();
-        }
-    }
-
-    fn reap_exited(&self) {
-        let _reap_gate = self
-            .spawn_gate
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.reap_exited();
+        if state.terminal_error.is_some() {
+            return;
+        }
+
+        state.terminal_error = Some(error.clone());
+        for (pid, process) in &state.processes {
+            if process.exit_tx.is_some() {
+                let _ = signal_process_group_or_process(*pid, libc::SIGKILL);
+            } else {
+                let _ = signal_process_group_only(*pid, libc::SIGKILL);
+            }
+        }
+        state.processes.clear();
+        drop(state);
+
+        // `send_replace` retains the failure even if the agent has not subscribed yet.
+        self.failure_tx.send_replace(Some(error));
+    }
+
+    async fn run(self: Arc<Self>, mut signal: Signal) -> Result<(), String> {
+        self.reap_until_idle()?;
+        while signal.recv().await.is_some() {
+            self.reap_until_idle()?;
+        }
+        Err("process manager SIGCHLD listener closed".to_string())
+    }
+
+    fn reap_until_idle(&self) -> Result<(), String> {
+        while self.reap_exited_batch()? {
+            // The state lock is released between batches. Yielding here gives
+            // a waiting spawn or signal request a chance to acquire it.
+            thread::yield_now();
+        }
+        Ok(())
+    }
+
+    fn reap_exited_batch(&self) -> Result<bool, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .reap_exited_batch()
+            .map_err(|error| format!("waitpid failed while reaping processes: {error}"))
     }
 }
 
@@ -231,6 +304,8 @@ impl ProcessManagerState {
     fn new() -> Self {
         Self {
             processes: HashMap::new(),
+            next_generation: 1,
+            terminal_error: None,
         }
     }
 
@@ -241,11 +316,29 @@ impl ProcessManagerState {
             )));
         }
 
-        let (sender, receiver) = oneshot::channel();
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            AgentdError::ExecSession("process registration generation exhausted".to_string())
+        })?;
+        let identity = ProcessIdentity { pid, generation };
+        let (exit_tx, receiver) = oneshot::channel();
         match self.processes.entry(pid) {
             Entry::Vacant(entry) => {
-                entry.insert(sender);
-                Ok(ProcessExitWatcher { pid, receiver })
+                entry.insert(TrackedProcess {
+                    generation,
+                    exit_tx: Some(exit_tx),
+                });
+                Ok(ProcessExitWatcher { identity, receiver })
+            }
+            Entry::Occupied(mut entry) if entry.get().exit_tx.is_none() => {
+                // A PID can only be reused after its old process group is gone.
+                // Replacing the completed registration invalidates the old
+                // session identity without rejecting the new exec request.
+                entry.insert(TrackedProcess {
+                    generation,
+                    exit_tx: Some(exit_tx),
+                });
+                Ok(ProcessExitWatcher { identity, receiver })
             }
             Entry::Occupied(_) => Err(AgentdError::ExecSession(format!(
                 "process PID {pid} is already tracked"
@@ -253,29 +346,52 @@ impl ProcessManagerState {
         }
     }
 
-    fn reap_exited(&mut self) {
-        loop {
+    fn matches(&self, identity: ProcessIdentity) -> bool {
+        self.processes
+            .get(&identity.pid)
+            .is_some_and(|process| process.generation == identity.generation)
+    }
+
+    /// Reaps at most one bounded batch.
+    ///
+    /// Returns `true` when the batch filled completely, which tells the caller
+    /// to yield and immediately check for more exited children without relying
+    /// on another (possibly coalesced) `SIGCHLD` notification.
+    fn reap_exited_batch(&mut self) -> std::io::Result<bool> {
+        let mut reaped = 0;
+        while reaped < REAP_BATCH_SIZE {
             let mut status = 0;
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid > 0 {
-                if let Some(sender) = self.processes.remove(&pid) {
-                    let _ = sender.send(exit_code(status));
+                reaped += 1;
+                let mut remove = false;
+                if let Some(process) = self.processes.get_mut(&pid)
+                    && let Some(exit_tx) = process.exit_tx.take()
+                {
+                    // Keep a completed registration as a tombstone while the
+                    // exec session drains output and remains signalable. If the
+                    // watcher was already dropped, no session owns the identity.
+                    remove = exit_tx.send(exit_code(status)).is_err();
+                }
+                if remove {
+                    self.processes.remove(&pid);
                 }
                 continue;
             }
             if pid == 0 {
-                break;
+                return Ok(false);
             }
 
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            if error.raw_os_error() != Some(libc::ECHILD) {
-                eprintln!("agentd: waitpid failed while reaping processes: {error}");
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(false);
             }
-            break;
+            return Err(error);
         }
+        Ok(true)
     }
 }
 
@@ -290,24 +406,38 @@ impl ProcessSpawnGuard<'_> {
     /// # Errors
     ///
     /// Returns an error when `pid` is not positive or is already tracked.
-    pub fn track(self, pid: i32) -> AgentdResult<ProcessExitWatcher> {
-        self.manager
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .track(pid)
+    pub fn track(mut self, pid: i32) -> AgentdResult<ProcessExitWatcher> {
+        match self.state.track(pid) {
+            Ok(exit_watcher) => Ok(exit_watcher),
+            Err(error) => {
+                // Registration failed while the state lock still prevents the
+                // reaper from freeing and reusing this PID.
+                if pid > 0 {
+                    let _ = signal_process_group_or_process(pid, libc::SIGKILL);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ProcessIdentity {
+    /// Returns the operating-system PID associated with this registration.
+    pub fn pid(self) -> i32 {
+        self.pid
+    }
+}
+
+impl ProcessExitWatcher {
+    /// Returns the stable identity of the tracked process.
+    pub fn identity(&self) -> ProcessIdentity {
+        self.identity
     }
 }
 
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
-
-impl Drop for ProcessSpawnGuard<'_> {
-    fn drop(&mut self) {
-        PROCESS_SPAWN_GUARD_HELD.set(false);
-    }
-}
 
 impl Future for ProcessExitWatcher {
     type Output = i32;
@@ -318,7 +448,7 @@ impl Future for ProcessExitWatcher {
             Poll::Ready(Err(error)) => {
                 eprintln!(
                     "agentd: process manager dropped the exit notification for PID {}: {error}",
-                    self.pid
+                    self.identity.pid
                 );
                 Poll::Ready(-1)
             }
@@ -351,8 +481,7 @@ fn run_process_manager_thread(
         match tokio::signal::unix::signal(SignalKind::child()) {
             Ok(signal) => {
                 let _ = startup.send(Ok(()));
-                manager.run(signal).await;
-                Err("process manager SIGCHLD listener closed".to_string())
+                manager.run(signal).await
             }
             Err(error) => {
                 let error = format!("install process manager SIGCHLD listener: {error}");
@@ -361,6 +490,47 @@ fn run_process_manager_thread(
             }
         }
     })
+}
+
+fn signal_process_group_or_process(pid: i32, signum: i32) -> AgentdResult<()> {
+    let group_result = unsafe { libc::kill(-pid, signum) };
+    if group_result == 0 {
+        return Ok(());
+    }
+
+    let group_error = std::io::Error::last_os_error();
+    if group_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(group_error.into());
+    }
+
+    // A failed pre-exec may exit before establishing its process group. The
+    // direct PID is still safe to target because the caller holds the current
+    // registration lock, so it cannot refer to a reused process here.
+    let process_result = unsafe { libc::kill(pid, signum) };
+    if process_result == 0 {
+        return Ok(());
+    }
+
+    let process_error = std::io::Error::last_os_error();
+    if process_error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(process_error.into())
+    }
+}
+
+fn signal_process_group_only(pid: i32, signum: i32) -> AgentdResult<()> {
+    let result = unsafe { libc::kill(-pid, signum) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error.into())
+    }
 }
 
 fn exit_code(status: i32) -> i32 {
@@ -379,7 +549,7 @@ fn exit_code(status: i32) -> i32 {
 mod tests {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::sync::{Arc, Barrier, TryLockError, mpsc};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -387,13 +557,12 @@ mod tests {
 
     const HELPER_ENV: &str = "MSB_AGENTD_PROCESS_MANAGER_HELPER";
     const HELPER_SENTINEL: &str = "process-manager-helper-passed";
-    const TEST_NAME: &str =
-        "process::tests::concurrent_spawns_are_tracked_before_exclusive_reaping";
+    const TEST_NAME: &str = "process::tests::reaping_is_batched_and_tracks_exit_codes";
 
     #[test]
-    fn concurrent_spawns_are_tracked_before_exclusive_reaping() {
+    fn reaping_is_batched_and_tracks_exit_codes() {
         if std::env::var_os(HELPER_ENV).is_some() {
-            run_concurrent_reap_scenario();
+            run_batched_reap_scenario();
             println!("{HELPER_SENTINEL}");
             return;
         }
@@ -440,28 +609,11 @@ mod tests {
     }
 
     #[test]
-    fn nested_spawn_guards_are_rejected() {
-        let manager = ProcessManager::new();
-        let first = manager
-            .spawn_guard()
-            .expect("acquire first process spawn guard");
-        let error = match manager.spawn_guard() {
-            Ok(_) => panic!("nested process spawn guard should be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("already holds"));
-
-        drop(first);
-        drop(
-            manager
-                .spawn_guard()
-                .expect("guard should be available after drop"),
-        );
-    }
-
-    #[test]
     fn terminal_failure_rejects_spawns_and_wakes_exits() {
         let manager = Arc::new(ProcessManager::new());
+        let mut failure_rx = manager
+            .subscribe_failure()
+            .expect("subscribe to process manager failure");
         let exit_watcher = manager
             .spawn_guard()
             .expect("acquire process spawn guard")
@@ -475,69 +627,118 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime");
+        runtime
+            .block_on(failure_rx.changed())
+            .expect("receive process manager failure");
+        assert_eq!(
+            failure_rx.borrow().as_deref(),
+            Some("process manager test failure")
+        );
         assert_eq!(runtime.block_on(exit_watcher), -1);
     }
 
-    fn run_concurrent_reap_scenario() {
+    #[test]
+    fn stale_identity_cannot_signal_reused_pid() {
+        const PID: i32 = 12345;
+
+        let manager = ProcessManager::new();
+        let first = manager
+            .spawn_guard()
+            .expect("acquire first process spawn guard")
+            .track(PID)
+            .expect("track first PID generation");
+        let first_identity = first.identity();
+        let first_exit_tx = manager
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .processes
+            .get_mut(&PID)
+            .expect("first process registration")
+            .exit_tx
+            .take()
+            .expect("first exit sender");
+        first_exit_tx.send(0).expect("send first exit code");
+
+        // The completed registration remains signalable until the session is
+        // released, which covers descendants still draining inherited output.
+        assert!(
+            manager
+                .signal_process_group(first_identity, i32::MAX)
+                .is_err()
+        );
+
+        let second = manager
+            .spawn_guard()
+            .expect("acquire second process spawn guard")
+            .track(PID)
+            .expect("track reused PID generation");
+        let second_identity = second.identity();
+        assert_ne!(first_identity, second_identity);
+
+        // An invalid signal proves the stale identity returns before making a
+        // syscall, while the current identity reaches `kill(2)` and gets EINVAL.
+        assert!(
+            manager
+                .signal_process_group(first_identity, i32::MAX)
+                .is_ok()
+        );
+        assert!(
+            manager
+                .signal_process_group(second_identity, i32::MAX)
+                .is_err()
+        );
+
+        manager.release(second_identity);
+        assert!(
+            manager
+                .signal_process_group(second_identity, i32::MAX)
+                .is_ok()
+        );
+    }
+
+    fn run_batched_reap_scenario() {
         let manager = Arc::new(ProcessManager::new());
-        let spawned = Arc::new(Barrier::new(3));
-        let release_tracking = Arc::new(Barrier::new(3));
-        let (exit_watcher_tx, exit_watcher_rx) = mpsc::channel();
+        let mut tracked = Vec::with_capacity(REAP_BATCH_SIZE + 1);
+        for offset in 0..=REAP_BATCH_SIZE {
+            let code = 10 + (offset % 50) as i32;
+            let guard = manager.spawn_guard().expect("acquire process spawn guard");
+            let child = Command::new("/bin/sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .expect("spawn tracked child");
+            let pid = child.id() as i32;
+            drop(child);
+            let exit_watcher = guard.track(pid).expect("track child");
+            tracked.push((pid, code, exit_watcher));
+        }
 
-        let first = spawn_tracked_process(
-            Arc::clone(&manager),
-            Arc::clone(&spawned),
-            Arc::clone(&release_tracking),
-            exit_watcher_tx.clone(),
-            41,
-        );
-        let second = spawn_tracked_process(
-            Arc::clone(&manager),
-            Arc::clone(&spawned),
-            Arc::clone(&release_tracking),
-            exit_watcher_tx,
-            42,
-        );
-
-        spawned.wait();
-        assert!(matches!(
-            manager.spawn_gate.try_write(),
-            Err(TryLockError::WouldBlock)
-        ));
-
-        let (reaped_tx, reaped_rx) = mpsc::channel();
-        let manager_thread = {
-            let manager = Arc::clone(&manager);
-            thread::spawn(move || {
-                manager.reap_exited();
-                reaped_tx.send(()).expect("report reap completion");
-            })
-        };
+        for (pid, _, _) in &tracked {
+            wait_until_exited_without_reaping(*pid);
+        }
 
         assert!(
-            reaped_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "exclusive reaping entered while spawn guards were active"
+            manager
+                .reap_exited_batch()
+                .expect("reap first bounded batch")
         );
-
-        release_tracking.wait();
-        let first_exit_watcher = exit_watcher_rx.recv().expect("first exit watcher");
-        let second_exit_watcher = exit_watcher_rx.recv().expect("second exit watcher");
-        reaped_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("process manager should proceed after both processes are tracked");
-
-        first.join().expect("first spawn thread");
-        second.join().expect("second spawn thread");
-        manager_thread.join().expect("process manager thread");
+        drop(
+            manager
+                .spawn_guard()
+                .expect("spawn lock should be released between reap batches"),
+        );
+        assert!(
+            !manager
+                .reap_exited_batch()
+                .expect("reap remaining children")
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime");
-        let (first_code, second_code) =
-            runtime.block_on(async { tokio::join!(first_exit_watcher, second_exit_watcher) });
-        let mut codes = [first_code, second_code];
-        codes.sort_unstable();
-        assert_eq!(codes, [41, 42]);
+        for (_, expected_code, exit_watcher) in tracked {
+            assert_eq!(runtime.block_on(exit_watcher), expected_code);
+        }
 
         let orphan = Command::new("/bin/sh")
             .args(["-c", "exit 43"])
@@ -547,34 +748,8 @@ mod tests {
         drop(orphan);
         wait_until_exited_without_reaping(orphan_pid);
 
-        manager.reap_exited();
+        assert!(!manager.reap_exited_batch().expect("reap untracked child"));
         assert_already_reaped(orphan_pid);
-    }
-
-    fn spawn_tracked_process(
-        manager: Arc<ProcessManager>,
-        spawned: Arc<Barrier>,
-        release_tracking: Arc<Barrier>,
-        exit_watcher_tx: mpsc::Sender<ProcessExitWatcher>,
-        code: i32,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            let guard = manager.spawn_guard().expect("acquire process spawn guard");
-            let child = Command::new("/bin/sh")
-                .args(["-c", &format!("exit {code}")])
-                .spawn()
-                .expect("spawn tracked child");
-            let pid = child.id() as i32;
-            drop(child);
-
-            spawned.wait();
-            release_tracking.wait();
-
-            let exit_watcher = guard.track(pid).expect("track child");
-            exit_watcher_tx
-                .send(exit_watcher)
-                .expect("send tracked exit watcher");
-        })
     }
 
     fn wait_until_exited_without_reaping(pid: i32) {

@@ -142,7 +142,8 @@ pub async fn run(
     config: &AgentdConfig,
     port_file: File,
 ) -> AgentdResult<()> {
-    let _process_manager = ProcessManager::get()?;
+    let process_manager = ProcessManager::get()?;
+    let mut process_manager_failure = process_manager.subscribe_failure()?;
 
     // Set non-blocking for async I/O. Early boot handshakes use the same fd
     // in blocking mode before it is moved into the async loop.
@@ -194,6 +195,17 @@ pub async fn run(
     // Main loop.
     'agent: loop {
         tokio::select! {
+            failure = process_manager_failure.changed() => {
+                let error = match failure {
+                    Ok(()) => process_manager_failure
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| "process manager stopped without an error".to_string()),
+                    Err(error) => format!("process manager failure channel closed: {error}"),
+                };
+                return Err(AgentdError::ExecSession(error));
+            }
+
             // Read from serial port.
             result = async_port.readable() => {
                 let Ok(mut guard) = result else {

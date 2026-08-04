@@ -5,11 +5,11 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::{iter, mem, ptr};
 
 use nix::pty;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use nix::sys::signal::Signal;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
@@ -17,7 +17,7 @@ use microsandbox_protocol::exec::{ExecFailed, ExecFailureKind, ExecRequest};
 
 use crate::config::SecurityProfile;
 use crate::error::{AgentdError, AgentdResult};
-use crate::process::{ProcessExitWatcher, ProcessManager};
+use crate::process::{ProcessExitWatcher, ProcessIdentity, ProcessManager};
 use crate::rlimit;
 
 //--------------------------------------------------------------------------------------------------
@@ -120,8 +120,11 @@ fn exec_failed_from_io_error(err: &std::io::Error, cmd: &str, stage: &str) -> Ex
 /// via the `mpsc` channel provided at spawn time.
 #[derive(Debug)]
 pub struct ExecSession {
-    /// The PID of the spawned process.
-    pid: i32,
+    /// Stable identity for the spawned process registration.
+    process_identity: ProcessIdentity,
+
+    /// Owns process status and serializes signals with PID reuse.
+    process_manager: Arc<ProcessManager>,
 
     /// The PTY master fd (only for PTY mode, used for writing and resize).
     pty_master: Option<OwnedFd>,
@@ -205,7 +208,6 @@ struct ExecErrorPipe {
 
 /// A piped process whose exit status is observed by [`ProcessManager`].
 struct PipedProcess {
-    pid: i32,
     stdin: Option<tokio::process::ChildStdin>,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
@@ -310,7 +312,7 @@ impl ExecSession {
 
     /// Returns the PID of the spawned process (as u32 for the protocol).
     pub fn pid(&self) -> u32 {
-        self.pid as u32
+        self.process_identity.pid() as u32
     }
 
     /// Writes data to the process's stdin (or PTY master).
@@ -351,11 +353,8 @@ impl ExecSession {
     pub fn send_signal(&self, signum: i32) -> AgentdResult<()> {
         let sig = Signal::try_from(signum)
             .map_err(|e| AgentdError::ExecSession(format!("invalid signal {signum}: {e}")))?;
-        match signal::kill(Pid::from_raw(-self.pid), sig) {
-            // The group can already be gone when the signal races the exit.
-            Err(nix::errno::Errno::ESRCH) => Ok(()),
-            other => Ok(other?),
-        }
+        self.process_manager
+            .signal_process_group(self.process_identity, sig as i32)
     }
 
     /// Closes the process's stdin.
@@ -375,7 +374,7 @@ impl ExecSession {
         tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
         default_user: Option<&str>,
         security_profile: SecurityProfile,
-        process_manager: &ProcessManager,
+        process_manager: &Arc<ProcessManager>,
     ) -> AgentdResult<Self> {
         let pty = pty::openpty(None, None)?;
         let err_pipe = new_exec_error_pipe()?;
@@ -445,8 +444,8 @@ impl ExecSession {
         // Pre-parse rlimits before fork (no allocations in child).
         let parsed_rlimits = rlimit::to_libc(&req.rlimits);
 
-        // Allow concurrent process creation while preventing the central
-        // reaper from observing this child before its PID is tracked.
+        // Prevent the central reaper from observing this child before its PID
+        // and generation are registered.
         let spawn_guard = process_manager.spawn_guard()?;
 
         // Fork.
@@ -540,18 +539,31 @@ impl ExecSession {
         drop(pty.slave);
         drop(err_pipe.write_end);
         let exit_watcher = spawn_guard.track(pid)?;
+        let process_identity = exit_watcher.identity();
 
-        if let Some(exec_errno) = read_exec_error(err_pipe.read_end.as_raw_fd())? {
-            drop(exit_watcher);
-            let io_err = std::io::Error::from_raw_os_error(exec_errno);
-            return Err(AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
-                &io_err, &req.cmd, "execvp",
-            )));
+        match read_exec_error(err_pipe.read_end.as_raw_fd()) {
+            Ok(Some(exec_errno)) => {
+                drop(exit_watcher);
+                process_manager.release(process_identity);
+                let io_err = std::io::Error::from_raw_os_error(exec_errno);
+                return Err(AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
+                    &io_err, &req.cmd, "execvp",
+                )));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ =
+                    process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
+                process_manager.release(process_identity);
+                return Err(error);
+            }
         }
 
         // Dup the master fd for the reader task.
         let reader_fd = unsafe { libc::dup(pty.master.as_raw_fd()) };
         if reader_fd < 0 {
+            let _ = process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
+            process_manager.release(process_identity);
             return Err(std::io::Error::last_os_error().into());
         }
         let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_fd) };
@@ -560,7 +572,8 @@ impl ExecSession {
         tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, tx));
 
         Ok(Self {
-            pid,
+            process_identity,
+            process_manager: Arc::clone(process_manager),
             pty_master: Some(pty.master),
             stdin: None,
         })
@@ -573,7 +586,7 @@ impl ExecSession {
         tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
         default_user: Option<&str>,
         security_profile: SecurityProfile,
-        process_manager: &ProcessManager,
+        process_manager: &Arc<ProcessManager>,
     ) -> AgentdResult<Self> {
         let mut cmd = Command::new(&req.cmd);
         cmd.args(&req.args)
@@ -621,21 +634,34 @@ impl ExecSession {
         }
 
         let PipedProcess {
-            pid,
             stdin,
             stdout,
             stderr,
             exit_watcher,
         } = spawn_piped_process(cmd, process_manager)?;
+        let process_identity = exit_watcher.identity();
 
         // Spawn background reader task.
         tokio::spawn(pipe_reader_task(id, stdout, stderr, exit_watcher, tx));
 
         Ok(Self {
-            pid,
+            process_identity,
+            process_manager: Arc::clone(process_manager),
             pty_master: None,
             stdin,
         })
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Drop for ExecSession {
+    fn drop(&mut self) {
+        // The registration deliberately outlives the direct child so signals
+        // can still reach descendants while their output is being drained.
+        self.process_manager.release(self.process_identity);
     }
 }
 
@@ -649,8 +675,8 @@ fn spawn_piped_process(
 ) -> AgentdResult<PipedProcess> {
     let cmd_label = command.get_program().to_string_lossy().into_owned();
 
-    // Allow concurrent process creation while preventing the central reaper
-    // from observing this child before its PID is tracked.
+    // Prevent the central reaper from observing this child before its PID and
+    // generation are registered.
     let spawn_guard = process_manager.spawn_guard()?;
     let mut child = command.spawn().map_err(|error| {
         AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
@@ -661,6 +687,7 @@ fn spawn_piped_process(
     })?;
     let pid = child.id() as i32;
     let exit_watcher = spawn_guard.track(pid)?;
+    let process_identity = exit_watcher.identity();
 
     let stdio = (|| {
         let stdin = child
@@ -684,7 +711,8 @@ fn spawn_piped_process(
         // The command has already exec'd successfully. If an async stdio
         // adapter cannot be registered, do not leave an unreported process
         // group running after the host receives ExecFailed.
-        let _ = signal::kill(Pid::from_raw(-pid), Signal::SIGKILL);
+        let _ = process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
+        process_manager.release(process_identity);
         AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
             &error,
             &cmd_label,
@@ -698,7 +726,6 @@ fn spawn_piped_process(
     drop(child);
 
     Ok(PipedProcess {
-        pid,
         stdin,
         stdout,
         stderr,
@@ -1323,10 +1350,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let req = ExecRequest {
             cmd: "/bin/sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "sleep 30 >/dev/null 2>&1 & echo $!".to_string(),
-            ],
+            args: vec!["-c".to_string(), "sleep 30 & echo $!".to_string()],
             env: Vec::new(),
             cwd: None,
             user: None,
@@ -1336,19 +1360,17 @@ mod tests {
             rlimits: Vec::new(),
         };
 
-        let _session = ExecSession::spawn(17, &req, tx, None, SecurityProfile::Default)
+        let session = ExecSession::spawn(17, &req, tx, None, SecurityProfile::Default)
             .expect("spawn background descendant session");
+        let leader_pid = session.pid() as i32;
         let mut stdout = Vec::new();
-        let mut exit = None;
         time::timeout(Duration::from_secs(10), async {
-            while let Some((id, output)) = rx.recv().await {
+            while !stdout.contains(&b'\n') {
+                let (id, output) = rx.recv().await.expect("session output");
                 assert_eq!(id, 17);
                 match output {
                     SessionOutput::Stdout(data) => stdout.extend_from_slice(&data),
-                    SessionOutput::Exited(code) => {
-                        exit = Some(code);
-                        break;
-                    }
+                    SessionOutput::Exited(code) => panic!("session exited early with {code}"),
                     SessionOutput::Stderr(_) | SessionOutput::Raw(_) => {}
                 }
             }
@@ -1356,7 +1378,6 @@ mod tests {
         .await
         .expect("wait for background descendant session");
 
-        assert_eq!(exit, Some(0));
         let descendant_pid: i32 = String::from_utf8(stdout)
             .expect("descendant PID is UTF-8")
             .trim()
@@ -1380,13 +1401,31 @@ mod tests {
         .await
         .expect("descendant should be adopted by the helper subreaper");
 
-        let ret = unsafe { libc::kill(descendant_pid, libc::SIGTERM) };
-        assert_eq!(
-            ret,
-            0,
-            "terminate descendant: {}",
-            std::io::Error::last_os_error()
-        );
+        let leader_path = format!("/proc/{leader_pid}");
+        time::timeout(Duration::from_secs(5), async {
+            while std::path::Path::new(&leader_path).exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("direct child should be reaped before signalling its descendants");
+
+        session
+            .send_signal(libc::SIGTERM)
+            .expect("signal descendants through completed process registration");
+        let exit = time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (id, output) = rx.recv().await.expect("session output after signal");
+                assert_eq!(id, 17);
+                if let SessionOutput::Exited(code) = output {
+                    break code;
+                }
+            }
+        })
+        .await
+        .expect("session should finish after its descendant is signalled");
+        assert_eq!(exit, 0);
+
         let proc_path = format!("/proc/{descendant_pid}");
         time::timeout(Duration::from_secs(5), async {
             while std::path::Path::new(&proc_path).exists() {
@@ -1605,25 +1644,6 @@ mod tests {
 
     fn run_piped_process_exit_scenario() {
         let process_manager = ProcessManager::get().expect("get process manager");
-        let (blocker_ready_tx, blocker_ready_rx) = std::sync::mpsc::channel();
-        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
-        let blocker_manager = std::sync::Arc::clone(&process_manager);
-        let blocker_thread = std::thread::spawn(move || {
-            let reap_blocker = blocker_manager
-                .spawn_guard()
-                .expect("block process reaping");
-            blocker_ready_tx
-                .send(())
-                .expect("report process reaping blocked");
-            release_blocker_rx
-                .recv()
-                .expect("wait to release process reaping");
-            drop(reap_blocker);
-        });
-        blocker_ready_rx
-            .recv()
-            .expect("wait for process reaping blocker");
-
         let spawning_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1647,13 +1667,6 @@ mod tests {
             .enable_all()
             .build()
             .expect("waiting runtime");
-        waiting_runtime.block_on(async {
-            time::sleep(Duration::from_millis(250)).await;
-        });
-        release_blocker_tx
-            .send(())
-            .expect("release process reaping blocker");
-        blocker_thread.join().expect("process reaping blocker");
         let code = waiting_runtime.block_on(async {
             time::timeout(Duration::from_secs(5), exit_watcher)
                 .await
@@ -1891,7 +1904,7 @@ mod tests {
             rlimits: Vec::new(),
         };
 
-        let process_manager = ProcessManager::new_for_test();
+        let process_manager = Arc::new(ProcessManager::new_for_test());
         let err = ExecSession::spawn_pipe(
             9,
             &req,
