@@ -121,11 +121,6 @@ impl ProcessManager {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test() -> Self {
-        Self::new()
-    }
-
     /// Opens a spawn section that must end by tracking the child PID.
     ///
     /// The returned guard serializes the short spawn-to-registration window with
@@ -610,6 +605,8 @@ mod tests {
 
     #[test]
     fn terminal_failure_rejects_spawns_and_wakes_exits() {
+        const UNUSED_PID: i32 = i32::MAX;
+
         let manager = Arc::new(ProcessManager::new());
         let mut failure_rx = manager
             .subscribe_failure()
@@ -617,7 +614,7 @@ mod tests {
         let exit_watcher = manager
             .spawn_guard()
             .expect("acquire process spawn guard")
-            .track(12345)
+            .track(UNUSED_PID)
             .expect("track test PID");
 
         manager.fail("process manager test failure".to_string());
@@ -638,8 +635,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_identity_cannot_signal_reused_pid() {
-        const PID: i32 = 12345;
+    fn stale_identity_does_not_match_reused_pid() {
+        const PID: i32 = i32::MAX;
 
         let manager = ProcessManager::new();
         let first = manager
@@ -660,12 +657,12 @@ mod tests {
             .expect("first exit sender");
         first_exit_tx.send(0).expect("send first exit code");
 
-        // The completed registration remains signalable until the session is
-        // released, which covers descendants still draining inherited output.
         assert!(
             manager
-                .signal_process_group(first_identity, i32::MAX)
-                .is_err()
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .matches(first_identity)
         );
 
         let second = manager
@@ -676,24 +673,31 @@ mod tests {
         let second_identity = second.identity();
         assert_ne!(first_identity, second_identity);
 
-        // An invalid signal proves the stale identity returns before making a
-        // syscall, while the current identity reaches `kill(2)` and gets EINVAL.
-        assert!(
-            manager
-                .signal_process_group(first_identity, i32::MAX)
-                .is_ok()
-        );
-        assert!(
-            manager
-                .signal_process_group(second_identity, i32::MAX)
-                .is_err()
-        );
+        let state = manager
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!state.matches(first_identity));
+        assert!(state.matches(second_identity));
+        drop(state);
 
+        // Releasing an old session must not unregister the new owner of the
+        // reused PID.
+        manager.release(first_identity);
+        assert!(
+            manager
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .matches(second_identity)
+        );
         manager.release(second_identity);
         assert!(
-            manager
-                .signal_process_group(second_identity, i32::MAX)
-                .is_ok()
+            !manager
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .matches(second_identity)
         );
     }
 

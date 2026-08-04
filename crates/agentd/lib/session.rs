@@ -1904,7 +1904,10 @@ mod tests {
             rlimits: Vec::new(),
         };
 
-        let process_manager = Arc::new(ProcessManager::new_for_test());
+        // Use the process-wide manager because other tests may have already
+        // started its reaper thread. A private manager cannot guard this spawn
+        // from the global `waitpid(-1, ...)` owner.
+        let process_manager = ProcessManager::get().expect("get process manager");
         let err = ExecSession::spawn_pipe(
             9,
             &req,
