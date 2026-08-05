@@ -655,7 +655,7 @@ export declare class RegistryConfigBuilder {
 export type JsRegistryConfigBuilder = RegistryConfigBuilder
 
 /**
- * Fluent builder for the writable rootfs layer (root disk) of an OCI image.
+ * Fluent builder for the root disk of an OCI image.
  *
  * Used inside `ImageBuilder.rootDisk((d) => ...)`:
  *
@@ -663,12 +663,13 @@ export type JsRegistryConfigBuilder = RegistryConfigBuilder
  * .imageWith((i) => i.oci("python:3.12").rootDisk(8192))                       // managed, sized
  * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.tmpfs().size(512))) // RAM-backed
  * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.disk("./scratch.img").fstype("ext4")))
+ * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.flat().size(8192)))
  * ```
  */
 export declare class RootDiskBuilder {
   constructor()
   /**
-   * Size in MiB. Valid for the managed (default) and tmpfs kinds; a
+   * Size in MiB. Valid for the managed (default), tmpfs, and flat kinds; a
    * user-supplied disk image is sized by the image file itself.
    */
   size(mib: number): this
@@ -677,6 +678,8 @@ export declare class RootDiskBuilder {
    * every boot, and the size counts against guest memory.
    */
   tmpfs(): this
+  /** Use a complete flat ext4 OCI rootfs without guest OverlayFS. */
+  flat(): this
   /**
    * Use a user-supplied disk image as the upper, attached writable. The
    * format is derived from the file extension (`.img`/`.raw` → raw,
@@ -689,10 +692,12 @@ export declare class RootDiskBuilder {
    */
   format(format: string): this
   /**
-   * Inner filesystem type of the disk image (e.g. `"ext4"`). Only valid
-   * after `.disk()`.
+   * Inner filesystem type (currently `"ext4"` for flat roots). Valid
+   * after `.disk()` or `.flat()`.
    */
   fstype(fstype: string): this
+  /** Select `"auto"`, `"copy"`, or `"reflink"` private-disk provisioning. */
+  cloneStrategy(strategy: string): this
 }
 export type JsRootDiskBuilder = RootDiskBuilder
 
@@ -981,11 +986,12 @@ export declare class SandboxBuilder {
    * Sugar over `imageWith((i) => i.oci(...).rootDisk(...))` — the root
    * disk lives on the OCI rootfs source, so an OCI image must be set
    * first. Pass a number of MiB for a managed root disk, or a callback
-   * for the tmpfs and disk-image kinds:
+   * for the tmpfs, flat, and disk-image kinds:
    *
    * ```ts
    * .image("python").rootDisk(8192)
    * .image("python").rootDisk((d) => d.tmpfs().size(512))
+   * .image("python").rootDisk((d) => d.flat().size(8192).cloneStrategy("auto"))
    * .image("python").rootDisk((d) => d.disk("./scratch.img"))
    * ```
    */
@@ -1552,6 +1558,7 @@ export type JsViolationActionBuilder = ViolationActionBuilder
 
 export declare class Volume {
   static get(name: string): Promise<VolumeHandle>
+  static getDefault(): Promise<VolumeHandle>
   static list(): Promise<Array<VolumeInfo>>
   static remove(name: string): Promise<void>
   get name(): string
@@ -1625,6 +1632,7 @@ export type JsVolumeFsWriteSink = VolumeFsWriteSink
 
 export declare class VolumeHandle {
   get name(): string
+  get isDefault(): boolean
   get quotaMib(): number | null
   get kind(): string
   get usedBytes(): number
@@ -2354,6 +2362,7 @@ export interface VolumeConfig {
 /** Volume handle info from the database. */
 export interface VolumeInfo {
   name: string
+  isDefault: boolean
   kind: string
   quotaMib?: number
   usedBytes: number
